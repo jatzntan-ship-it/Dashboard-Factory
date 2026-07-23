@@ -116,6 +116,66 @@ function xeroParsePL(json, colCount) {
   return { revenue, cogs, wagesSuper, overheads };
 }
 
+/* ---- Square POS helpers (kpi-spec.md: transaction COUNT only, never a
+   dollar figure; completed orders, voids/cancels excluded, refunds don't
+   reduce the count) ---- */
+const SQUARE_BASE = 'https://connect.squareup.com';
+function squareHeaders(env) {
+  return {
+    'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''),
+    'Square-Version': '2026-05-20',
+    'Content-Type': 'application/json'
+  };
+}
+async function squareLocations(env, h) {
+  const json = await h.fetchJson(SQUARE_BASE + '/v2/locations', { headers: squareHeaders(env) }, { auth: false });
+  return (json.locations || []).filter(l => l.status === 'ACTIVE');
+}
+/* UTC instant for local midnight (+ extraHours, for trading-day rollover) in
+   the given IANA timezone, on the given YYYY-MM-DD calendar date. */
+function zonedDayBoundaryUTC(dateStr, tz, extraHours) {
+  const asUTC = new Date(dateStr + 'T00:00:00Z');
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const parts = fmt.formatToParts(asUTC).reduce((a, p) => { if (p.type !== 'literal') a[p.type] = p.value; return a; }, {});
+  const localAsIfUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+  const offsetMs = localAsIfUTC - asUTC.getTime();
+  return new Date(asUTC.getTime() - offsetMs + (extraHours || 0) * 3600 * 1000).toISOString();
+}
+function addDaysStr(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+async function squareCountCompleted(env, h, startAt, endAt) {
+  const locations = await squareLocations(env, h);
+  const locationIds = locations.map(l => l.id);
+  if (!locationIds.length) return 0;
+  let count = 0, cursor;
+  do {
+    const body = {
+      location_ids: locationIds,
+      return_entries: true,
+      limit: 500,
+      query: {
+        filter: {
+          date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+          state_filter: { states: ['COMPLETED'] }
+        },
+        sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' }
+      },
+      ...(cursor ? { cursor } : {})
+    };
+    const json = await h.fetchJson(SQUARE_BASE + '/v2/orders/search',
+      { method: 'POST', headers: squareHeaders(env), body: JSON.stringify(body) }, { auth: false });
+    count += (json.order_entries || []).length;
+    cursor = json.cursor;
+  } while (cursor);
+  return count;
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -203,12 +263,39 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      const locations = await squareLocations(env, h);
+      return { connected: true, org: locations.map(l => l.name).filter(Boolean).join(', ') || null, sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      const startAt = zonedDayBoundaryUTC(q.from, q.tz, q.rollover);
+      const endAt = zonedDayBoundaryUTC(addDaysStr(q.to, 1), q.tz, q.rollover);
+      const count = await squareCountCompleted(env, h, startAt, endAt);
+      return { count };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = [];
+      let [y, m] = q.fromMonth.split('-').map(Number);
+      const [ey, em] = q.toMonth.split('-').map(Number);
+      while (y < ey || (y === ey && m <= em)) {
+        months.push(y + '-' + String(m).padStart(2, '0'));
+        m++; if (m > 12) { m = 1; y++; }
+      }
+      const count = [];
+      for (const mo of months) {
+        const [yy, mm] = mo.split('-').map(Number);
+        const first = mo + '-01';
+        const nextMonth = mm === 12 ? (yy + 1) + '-01' : yy + '-' + String(mm + 1).padStart(2, '0');
+        const last = addDaysStr(nextMonth + '-01', -1);
+        const startAt = zonedDayBoundaryUTC(first, q.tz, q.rollover);
+        const endAt = zonedDayBoundaryUTC(addDaysStr(last, 1), q.tz, q.rollover);
+        count.push(await squareCountCompleted(env, h, startAt, endAt));
+      }
+      return { months, count };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
